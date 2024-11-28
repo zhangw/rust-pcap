@@ -11,8 +11,13 @@ struct TcpSession {
     dst_port: u16,
 }
 
+fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
+    let octets = ip.octets();
+    u32::from_be_bytes(octets)
+}
+
 #[derive(Debug)]
-struct TcpPacket<'a> {
+struct TcpPacket {
     session: TcpSession,
     ack: u32,
     seq: u32,
@@ -21,7 +26,24 @@ struct TcpPacket<'a> {
     t_fin: bool,
     t_rst: bool,
     cap_len: u32,
-    payload: &'a [u8],
+    payload: Vec<u8>,
+    message_id: u64,
+}
+
+impl TcpPacket {
+    fn message_id(&mut self) -> u64 {
+        if self.message_id == 0 {
+            // self.message_id =
+            let mut id =
+                (self.session.src_port as u64) << 48 | (self.session.dst_port as u64) << 32;
+            let src_ip_val = ipv4_to_u32(self.session.src_ip) as u64;
+            let dest_ip_val = ipv4_to_u32(self.session.dst_ip) as u64;
+            let ip_val = (src_ip_val + dest_ip_val) & 0xffff_ffff;
+            id |= ip_val ^ (self.ack as u64);
+            self.message_id = id;
+        }
+        self.message_id
+    }
 }
 
 #[derive(Debug)]
@@ -126,11 +148,38 @@ fn parse(packet: Packet) -> Result<TcpPacket, PacketError> {
                 t_rst: transfer_layer[13] & 0x04 != 0,
                 t_ack: transfer_layer[13] & 0x10 != 0,
                 cap_len: pkth_caplen,
-                payload: &ndata[dof as usize..],
+                payload: ndata[dof as usize..].to_vec(),
+                message_id: 0,
             };
             return Ok(tcp_packet);
         } else {
             return Err(PacketError::new("Only IPv4 supported"));
+        }
+    }
+}
+
+fn process_packet(packet: Packet, tcp_streams: &mut HashMap<u64, Vec<Vec<u8>>>) {
+    let mut tcp_packet = match parse(packet) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Parse Tcp Error: {}", e);
+            return;
+        }
+    };
+    let message_id = tcp_packet.message_id();
+    let grp_packets = tcp_streams.entry(message_id).or_insert(vec![]);
+    if tcp_packet.payload.len() > 0 {
+        grp_packets.push(tcp_packet.payload);
+        let tailer = grp_packets.last().unwrap();
+        if tailer.ends_with(&[0x0a]) {
+            let mut http_data = Vec::new();
+            for p in grp_packets.iter() {
+                http_data.extend(p);
+            }
+            let http_str = String::from_utf8(http_data).unwrap();
+            println!("HTTP Data: {}", http_str);
+            grp_packets.clear();
+            tcp_streams.remove(&message_id);
         }
     }
 }
@@ -171,30 +220,17 @@ fn main() {
         "Listening on port {} for TCP traffic on device {}",
         port, device_name
     );
-    let mut tcp_streams: HashMap<TcpSession, Vec<u8>> = HashMap::new();
+    let mut tcp_streams: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
     loop {
         match cap.next_packet() {
-            Ok(packet) => {
-                let tcp_packet = parse(packet).unwrap();
-                println!("{:?}", tcp_packet);
-                // let tcp_payload = &pkt_data[54..];
-                // let stream = tcp_streams.entry(session).or_insert_with(Vec::new);
-                // stream.extend_from_slice(tcp_payload);
-                // if let Ok(payload_str) = str::from_utf8(stream) {
-                //     if payload_str.contains("\r\n\r\n") {
-                //         println!("HTTP Request:\n{}", payload_str);
-                //         stream.clear();
-                //     }
-                // }
-            }
+            Ok(packet) => process_packet(packet, &mut tcp_streams),
             Err(pcap::Error::TimeoutExpired) => {
                 println!("Timeout expired, no packets captured. Waiting...");
-                continue;
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Pcap Error: {}", e);
                 break;
             }
-        }
+        };
     }
 }
